@@ -4,6 +4,7 @@
 //! count, a walltime progress bar, point burn against the group's balance, the
 //! node the job landed on, and the log path to tail.
 
+mod cluster;
 mod fmt;
 mod pbs;
 mod render;
@@ -18,6 +19,7 @@ USAGE:
     qrich [OPTIONS] [JOBID...]
 
 OPTIONS:
+    -c, --cluster       cluster-wide capacity: free GPUs/CPUs/nodes, what fits
     -l, --long          one detailed card per job (usage, points, log path)
     -a, --all           every user's jobs, not just your own
     -u, --user USER     jobs owned by USER
@@ -38,6 +40,7 @@ NOTES:
 ";
 
 struct Opts {
+    cluster: bool,
     long: bool,
     all_users: bool,
     user: Option<String>,
@@ -52,6 +55,7 @@ struct Opts {
 
 fn parse_args() -> Result<Option<Opts>, String> {
     let mut o = Opts {
+        cluster: false,
         long: false,
         all_users: false,
         user: None,
@@ -76,6 +80,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
                 println!("qrich {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
+            "-c" | "--cluster" => o.cluster = true,
             "-l" | "--long" => o.long = true,
             "-a" | "--all" => o.all_users = true,
             "-x" | "--history" => o.history = true,
@@ -129,6 +134,26 @@ fn current_user() -> String {
 }
 
 fn draw(o: &Opts, tz: i64, rates: &std::collections::HashMap<String, f64>) -> Result<String, String> {
+    let color = o
+        .color
+        .unwrap_or_else(|| std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err());
+    let width = o.width.unwrap_or_else(pbs::term_width);
+
+    if o.cluster {
+        let c = cluster::fetch(tz)?;
+        let view = render::View {
+            color,
+            ascii: o.ascii,
+            width,
+            long: o.long,
+            show_points: o.points,
+            rates,
+            tz,
+            now: c.timestamp,
+        };
+        return Ok(render::render_cluster(&c, &view));
+    }
+
     let snap = pbs::fetch(o.history, &o.ids, tz)?;
 
     // An explicit job id means "show me this job", whoever owns it.
@@ -170,10 +195,6 @@ fn draw(o: &Opts, tz: i64, rates: &std::collections::HashMap<String, f64>) -> Re
             .unwrap_or(0)
     };
 
-    let color = o
-        .color
-        .unwrap_or_else(|| std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err());
-
     let who = match (&filter_owner, o.ids.is_empty()) {
         (Some(u), _) => u.clone(),
         (None, false) => "selected jobs".to_string(),
@@ -183,7 +204,7 @@ fn draw(o: &Opts, tz: i64, rates: &std::collections::HashMap<String, f64>) -> Re
     let view = render::View {
         color,
         ascii: o.ascii,
-        width: o.width.unwrap_or_else(pbs::term_width),
+        width,
         long: o.long,
         show_points: o.points,
         rates,

@@ -150,6 +150,19 @@ pub fn short_datetime(epoch: i64, tz_offset_secs: i64) -> String {
     )
 }
 
+/// Coarse distance in time: `16d 11h`, `3h 20m`, `45m`.
+pub fn until(secs: i64) -> String {
+    let s = secs.max(0);
+    let (d, h, m) = (s / 86400, (s % 86400) / 3600, (s % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
 const PARTIALS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 
 /// A proportional bar `width` cells wide, using eighth-blocks for the remainder.

@@ -621,6 +621,170 @@ fn footer(jobs: &[&Job], view: &View, groups: &[String]) -> String {
     out
 }
 
+/// Cluster capacity: three meters, then what would actually start.
+pub fn render_cluster(c: &crate::cluster::Cluster, view: &View) -> String {
+    let mut out = String::new();
+    let sep = view.sep();
+
+    out.push_str(&format!(
+        " {}{}{}{}{}\n",
+        view.c("1", &format!("ABCI-Q {}", c.server)),
+        sep,
+        view.c("36", "cluster"),
+        sep,
+        view.dim(&short_datetime(c.timestamp, view.tz))
+    ));
+    out.push_str(&format!(
+        " {}\n\n",
+        view.dim(&format!(
+            "{} nodes reachable by {}{}",
+            c.pool,
+            c.queue,
+            if c.offline > 0 {
+                format!(" · {} offline/down excluded", c.offline)
+            } else {
+                String::new()
+            }
+        ))
+    ));
+
+    let meter = |label: &str, free: u64, total: u64, tail: String| -> String {
+        let used = total.saturating_sub(free);
+        let frac = if total > 0 {
+            used as f64 / total as f64
+        } else {
+            0.0
+        };
+        format!(
+            " {} {} {} {}\n",
+            view.dim(&pad(label, 5)),
+            view.bar_cell(Some(frac), 20),
+            view.c(
+                view.bar_color(frac),
+                &rpad(&format!("{:.0}%", frac * 100.0), 4)
+            ),
+            tail
+        )
+    };
+    out.push_str(&meter(
+        "GPU",
+        c.gpus_free,
+        c.gpus_total,
+        format!(
+            "{} of {} free",
+            commas(c.gpus_free as f64),
+            commas(c.gpus_total as f64)
+        ),
+    ));
+    out.push_str(&meter(
+        "CPU",
+        c.cpus_free,
+        c.cpus_total,
+        format!(
+            "{} of {} cores free",
+            commas(c.cpus_free as f64),
+            commas(c.cpus_total as f64)
+        ),
+    ));
+    out.push_str(&meter(
+        "NODE",
+        c.nodes_idle as u64,
+        c.usable() as u64,
+        format!("{} idle · {} in use", c.nodes_idle, c.nodes_busy),
+    ));
+
+    let line = |label: &str, body: String| -> String {
+        format!(" {} {}\n", view.dim(&pad(label, 11)), body)
+    };
+
+    out.push('\n');
+    let idle = c.nodes_idle as u64;
+    let capped = c.limit_user_nodes.map(|l| idle.min(l)).unwrap_or(idle);
+    out.push_str(&line(
+        "fits now",
+        format!(
+            "rt_QF={}{}{}rt_QG {} GPUs{}rt_QC {} cores",
+            capped,
+            // Say why the number is not simply the idle count.
+            if capped < idle {
+                format!(" ({idle} idle, per-user cap {capped})")
+            } else if c.free_gpus_on_busy > 0 {
+                format!(" whole nodes (+{} GPUs free on shared nodes)", c.free_gpus_on_busy)
+            } else {
+                " whole nodes".to_string()
+            },
+            sep,
+            commas(c.gpus_free as f64),
+            sep,
+            commas(c.cpus_free as f64)
+        ),
+    ));
+
+    let mut limits = Vec::new();
+    if let Some(l) = c.limit_user_nodes {
+        limits.push(format!("{l} rt_QF nodes running per user"));
+    }
+    if let Some(l) = c.limit_cluster_nodect {
+        limits.push(format!("{l} nodes running cluster-wide"));
+    }
+    if !limits.is_empty() {
+        out.push_str(&line("limits", limits.join(&sep)));
+    }
+
+    out.push_str(&line(
+        "jobs",
+        format!(
+            "{} running{}{} queued{}{} held",
+            c.running, sep, c.queued, sep, c.held
+        ),
+    ));
+
+    if let Some(r) = &c.next_resv {
+        let away = r.start - c.timestamp;
+        out.push_str(&line(
+            "next window",
+            format!(
+                "{} → {}{}{}{}{} nodes{}in {}",
+                short_datetime(r.start, view.tz),
+                same_day_end(r.start, r.end, view.tz),
+                sep,
+                r.name,
+                sep,
+                r.nodect,
+                sep,
+                crate::fmt::until(away)
+            ),
+        ));
+        // A walltime that would overrun the window keeps the job queued.
+        if away < 72 * 3600 {
+            out.push_str(&format!(
+                " {} {}\n",
+                view.c("31", view.warn_sign()),
+                view.c(
+                    "31",
+                    &format!(
+                        "a job asking more than {} of walltime will not start before it",
+                        crate::fmt::until(away)
+                    )
+                )
+            ));
+        }
+    }
+
+    out
+}
+
+/// End of a window, dropping the date when it is the same day as the start.
+fn same_day_end(start: i64, end: i64, tz: i64) -> String {
+    let (s, e) = (short_datetime(start, tz), short_datetime(end, tz));
+    let day = |x: &str| x.split(' ').take(2).collect::<Vec<_>>().join(" ");
+    if day(&s) == day(&e) {
+        e.split(' ').nth(2).unwrap_or(&e).to_string()
+    } else {
+        e
+    }
+}
+
 /// `5` not `5.0`, but keep a decimal when there is one.
 fn trim_num(v: f64) -> String {
     if (v - v.round()).abs() < 0.05 {
