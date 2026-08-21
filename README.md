@@ -8,10 +8,10 @@ group's balance, the node the job landed on, and the log path to tail.
  ABCI-Q qjcm · <user> · 13 running · 3 held · 52 GPU · 68 pt/h · 21 Aug 14:03
 
  ID          NAME                     TYPE       GPU WALLTIME             % USED/REQ       GROUP      POINTS       NODE
- 190662   ●R train_large_4gpu.sh     rt_QF        4 ▕███████████▏░░▏   80% 19:08/24:00    <group-a>  96/120       qh349
- 190524   ●R train_multinode.sh        rt_QF×2      8 ▕███████░░░░░░░▏   50% 24:04/48:00    <group-b>  241/480      qh352+2
- 191417   ●R sweep_lr_01_06            rt_QG        1 ▕▏░░░░░░░░░░░░░▏    1% 0:15/24:00     <group-b>  1/48         qh339
- 190746   ●H eval.sh                   rt_QG        1   held 15:26         - -/4:00         <group-a>  0/8          -
+ 190662   ●R train_large_4gpu.sh      rt_QF        4 ▕███████████▏░░▏   80% 19:08/24:00    <group-a>  96/120       qh349
+ 190524   ●R train_multinode.sh       rt_QF×2      8 ▕███████░░░░░░░▏   50% 24:04/48:00    <group-b>  241/480      qh352+2
+ 191417   ●R sweep_lr_01_06           rt_QG        1 ▕▏░░░░░░░░░░░░░▏    1% 0:15/24:00     <group-b>  1/48         qh339
+ 190746   ●H eval.sh                  rt_QG        1   held 15:26         - -/4:00         <group-a>  0/8          -
 
  1,108 pt spent so far · 2,800 pt reserved by these jobs
  <group-a>    ▕███████████▍▏  94% 17,000 left of 300,000
