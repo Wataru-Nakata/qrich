@@ -36,7 +36,13 @@ header says `charged <group>` once and the space goes to the job name instead.
 - Points are invisible in `qstat`. qrich prices each job from its resource type
   and shows the group's remaining balance from `show_point`.
 
-## Build and install
+## Install
+
+```bash
+cargo install --git https://github.com/Wataru-Nakata/qrich    # -> ~/.cargo/bin/qrich
+```
+
+Or from a clone:
 
 ```bash
 cargo build --release                          # needs the rust toolchain
@@ -110,6 +116,15 @@ Spent is `rate × elapsed`, reserved is `rate × requested walltime` — the amo
 PBS holds up-front. Both are estimates from the rate card, not a billing record;
 `show_point` remains the authority.
 
+## Scope
+
+Written for **ABCI-Q** (AIST). The generic half — walltime bars, job cards,
+resource/usage parsing — is plain PBS Professional and should work on any PBS
+cluster. The ABCI-Q specifics are: the `rt_Q*` resource types, the point rate
+card, the `abciq` queue used to filter the node pool in `-c`, and the
+`/usr/local/bin` command wrappers. Adapting it elsewhere mostly means changing
+those.
+
 ## Layout
 
 | File | Role |
@@ -118,3 +133,7 @@ PBS holds up-front. Both are estimates from the rate card, not a billing record;
 | `src/pbs.rs` | running `qstat`/`show_point`, JSON → `Job`, point rates |
 | `src/render.rs` | responsive table, long cards, footer warnings |
 | `src/fmt.rs` | PBS durations, sizes, timestamps, bars, padding |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
