@@ -1,0 +1,14 @@
+[package]
+name = "qrich"
+version = "0.1.0"
+edition = "2021"
+description = "Rich, visualized qstat for the ABCI-Q PBS Professional cluster"
+repository = "https://github.com/sarulab-speech/agentskills"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
