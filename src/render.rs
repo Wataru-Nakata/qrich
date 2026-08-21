@@ -49,6 +49,20 @@ impl View<'_> {
         self.dim(if self.ascii { " | " } else { " · " })
     }
 
+    /// Stable colour per charging group, so the same group reads the same in
+    /// the table and in the footer. With only one group there is nothing to
+    /// tell apart.
+    fn group_color(&self, g: &str, groups: &[String]) -> &'static str {
+        const GROUP_COLORS: [&str; 6] = ["36", "35", "94", "33", "96", "95"];
+        if groups.len() < 2 {
+            return "2";
+        }
+        match groups.iter().position(|x| x == g) {
+            Some(i) => GROUP_COLORS[i % GROUP_COLORS.len()],
+            None => "2",
+        }
+    }
+
     /// Colour a walltime bar by how close the job is to being killed.
     fn bar_color(&self, frac: f64) -> &'static str {
         if frac >= 0.9 {
@@ -84,6 +98,7 @@ struct Cols {
     gpu: bool,
     bar: bool,
     time: bool,
+    group: bool,
     points: bool,
     node: bool,
 }
@@ -95,6 +110,7 @@ const W_GPU: usize = 4;
 const W_BAR: usize = 14;
 const W_PCT: usize = 5;
 const W_TIME: usize = 14;
+const W_GROUP: usize = 10;
 const W_PTS: usize = 12;
 const W_NODE: usize = 9;
 const MIN_NAME: usize = 14;
@@ -112,6 +128,9 @@ impl Cols {
         if self.time {
             w += W_TIME + 1;
         }
+        if self.group {
+            w += W_GROUP + 1;
+        }
         if self.points {
             w += W_PTS + 1;
         }
@@ -122,16 +141,18 @@ impl Cols {
     }
 }
 
-fn fit(width: usize) -> (Cols, usize) {
+fn fit(width: usize, multi_group: bool) -> (Cols, usize) {
     let mut cols = Cols {
         gpu: true,
         bar: true,
         time: true,
+        // One group needs no column — the header states it once instead.
+        group: multi_group,
         points: true,
         node: true,
     };
     // Drop columns least-first until the name column can breathe.
-    for step in 0..5 {
+    for step in 0..6 {
         if cols.fixed() + MIN_NAME <= width {
             break;
         }
@@ -140,6 +161,7 @@ fn fit(width: usize) -> (Cols, usize) {
             1 => cols.points = false,
             2 => cols.gpu = false,
             3 => cols.bar = false,
+            4 => cols.group = false,
             _ => cols.time = false,
         }
     }
@@ -147,9 +169,23 @@ fn fit(width: usize) -> (Cols, usize) {
     (cols, name)
 }
 
+/// Distinct charging groups across the listed jobs, sorted so colours are
+/// stable between refreshes.
+fn charging_groups(jobs: &[&Job]) -> Vec<String> {
+    let mut g: Vec<String> = jobs
+        .iter()
+        .filter(|j| !j.group.is_empty())
+        .map(|j| j.group.clone())
+        .collect();
+    g.sort();
+    g.dedup();
+    g
+}
+
 pub fn render(snap: &Snapshot, jobs: &[&Job], view: &View, who: &str) -> String {
     let mut out = String::new();
-    out.push_str(&header(snap, jobs, view, who));
+    let groups = charging_groups(jobs);
+    out.push_str(&header(snap, jobs, view, who, &groups));
     if !view.long {
         out.push('\n');
     }
@@ -165,21 +201,21 @@ pub fn render(snap: &Snapshot, jobs: &[&Job], view: &View, who: &str) -> String 
     if view.long {
         for j in jobs {
             out.push('\n');
-            out.push_str(&card(j, view));
+            out.push_str(&card(j, view, &groups));
         }
     } else {
-        let (cols, name_w) = fit(view.width);
+        let (cols, name_w) = fit(view.width, groups.len() > 1);
         out.push_str(&table_header(&cols, name_w, view));
         for j in jobs {
-            out.push_str(&row(j, &cols, name_w, view));
+            out.push_str(&row(j, &cols, name_w, view, &groups));
         }
     }
 
-    out.push_str(&footer(jobs, view));
+    out.push_str(&footer(jobs, view, &groups));
     out
 }
 
-fn header(snap: &Snapshot, jobs: &[&Job], view: &View, who: &str) -> String {
+fn header(snap: &Snapshot, jobs: &[&Job], view: &View, who: &str, groups: &[String]) -> String {
     let mut counts: Vec<(State, usize)> = Vec::new();
     for j in jobs {
         match counts.iter_mut().find(|(s, _)| *s == j.state) {
@@ -213,6 +249,9 @@ fn header(snap: &Snapshot, jobs: &[&Job], view: &View, who: &str) -> String {
     if burn > 0.0 {
         parts.push(format!("{} pt/h", trim_num(burn)));
     }
+    if groups.len() == 1 {
+        parts.push(format!("charged {}", groups[0]));
+    }
     parts.push(view.dim(&short_datetime(view.now, view.tz)));
 
     format!(" {}\n", parts.join(&view.sep()))
@@ -230,6 +269,9 @@ fn table_header(cols: &Cols, name_w: usize, view: &View) -> String {
     if cols.time {
         line.push_str(&format!("{} ", pad("USED/REQ", W_TIME)));
     }
+    if cols.group {
+        line.push_str(&format!("{} ", pad("GROUP", W_GROUP)));
+    }
     if cols.points {
         line.push_str(&format!("{} ", pad("POINTS", W_PTS)));
     }
@@ -239,7 +281,7 @@ fn table_header(cols: &Cols, name_w: usize, view: &View) -> String {
     format!("{}\n", view.dim(line.trim_end()))
 }
 
-fn row(j: &Job, cols: &Cols, name_w: usize, view: &View) -> String {
+fn row(j: &Job, cols: &Cols, name_w: usize, view: &View, groups: &[String]) -> String {
     let frac = j.walltime_frac();
 
     let mut line = String::from(" ");
@@ -299,6 +341,19 @@ fn row(j: &Job, cols: &Cols, name_w: usize, view: &View) -> String {
         line.push(' ');
     }
 
+    if cols.group {
+        let g = if j.group.is_empty() {
+            "-".to_string()
+        } else {
+            j.group.clone()
+        };
+        line.push_str(&view.c(
+            view.group_color(&j.group, groups),
+            &pad(&ellipsize(&g, W_GROUP), W_GROUP),
+        ));
+        line.push(' ');
+    }
+
     if cols.points {
         let p = match (j.points_spent(view.rates), j.points_reserved(view.rates)) {
             (Some(sp), Some(rv)) => format!("{}/{}", points(sp), points(rv)),
@@ -323,7 +378,7 @@ fn row(j: &Job, cols: &Cols, name_w: usize, view: &View) -> String {
     format!("{}\n", line.trim_end())
 }
 
-fn card(j: &Job, view: &View) -> String {
+fn card(j: &Job, view: &View, groups: &[String]) -> String {
     let mut out = String::new();
     let frac = j.walltime_frac();
 
@@ -358,7 +413,10 @@ fn card(j: &Job, view: &View) -> String {
         spec.push(j.nodes.join(","));
     }
     if !j.group.is_empty() {
-        spec.push(format!("charged {}", j.group));
+        spec.push(format!(
+            "charged {}",
+            view.c(view.group_color(&j.group, groups), &j.group)
+        ));
     }
     out.push_str(&format!("   {}\n", spec.join(&view.sep())));
 
@@ -473,7 +531,7 @@ fn card(j: &Job, view: &View) -> String {
     out
 }
 
-fn footer(jobs: &[&Job], view: &View) -> String {
+fn footer(jobs: &[&Job], view: &View, groups: &[String]) -> String {
     let mut out = String::new();
 
     let spent: f64 = jobs.iter().filter_map(|j| j.points_spent(view.rates)).sum();
@@ -517,13 +575,6 @@ fn footer(jobs: &[&Job], view: &View) -> String {
     }
 
     if view.show_points {
-        let mut groups: Vec<&String> = jobs
-            .iter()
-            .filter(|j| !j.group.is_empty())
-            .map(|j| &j.group)
-            .collect();
-        groups.sort();
-        groups.dedup();
         if !groups.is_empty() {
             let balances: Vec<GroupPoints> = crate::pbs::show_point();
             for g in groups {
@@ -541,7 +592,7 @@ fn footer(jobs: &[&Job], view: &View) -> String {
                     let over = committed > b.left();
                     out.push_str(&format!(
                         " {} {} {} {} left of {}{}\n",
-                        pad(g, 12),
+                        view.c(view.group_color(g, groups), &pad(g, 12)),
                         view.bar_cell(Some(used_frac), 12),
                         view.c(
                             view.bar_color(used_frac),

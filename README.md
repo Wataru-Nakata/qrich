@@ -5,17 +5,23 @@ table leaves out: GPU count, a walltime progress bar, point burn against the
 group's balance, the node the job landed on, and the log path to tail.
 
 ```
- ABCI-Q qjcm · <user> · 13 running · 2 held · 48 GPU · 64 pt/h · 21 Aug 12:20
+ ABCI-Q qjcm · <user> · 13 running · 3 held · 52 GPU · 68 pt/h · 21 Aug 14:03
 
- ID          NAME                    TYPE       GPU WALLTIME             % USED/REQ       POINTS       NODE
- 190662   ●R train_csj_sbint06_card… rt_QF        4 ▕██████████▏░░░▏   73% 17:25/24:00    87/120       qh349
- 190524   ●R train.sh                rt_QF×2      8 ▕██████▌░░░░░░░▏   46% 22:16/48:00    223/480      qh352+2
- 191417   ●R xrs_xl16_01_06          rt_QG        1 ▕▏░░░░░░░░░░░░░▏    1% 0:15/24:00     1/48         qh339
- 190746   ●H eval_csj.sh             rt_QG        1   held 15:26         - -/4:00         0/8          -
+ ID          NAME                     TYPE       GPU WALLTIME             % USED/REQ       GROUP      POINTS       NODE
+ 190662   ●R train_csj_sbint06_card… rt_QF        4 ▕███████████▏░░▏   80% 19:08/24:00    <group-a>  96/120       qh349
+ 190524   ●R train.sh                 rt_QF×2      8 ▕███████░░░░░░░▏   50% 24:04/48:00    <group-b>  241/480      qh352+2
+ 191417   ●R xrs_xl16_01_06           rt_QG        1 ▕▏░░░░░░░░░░░░░▏    1% 0:15/24:00     <group-b>  1/48         qh339
+ 190746   ●H eval_csj.sh              rt_QG        1   held 15:26         - -/4:00         <group-a>  0/8          -
 
  1,108 pt spent so far · 2,800 pt reserved by these jobs
- <group>      ▕███████████▍▏  94% 16,939 left of 300,000
+ <group-a>    ▕███████████▍▏  94% 16,939 left of 300,000
+ <group-b>    ▕██████████▍░▏  87% 8,032 left of 60,000
 ```
+
+Each job shows the group it is **charged** to (`#PBS -W group_list=`), colour-
+coded so the same group reads the same in the table and in the balance lines
+underneath. When every listed job charges one group there is no column — the
+header says `charged <group>` once and the space goes to the job name instead.
 
 ## Why not just `qstat`
 
