@@ -110,26 +110,32 @@ you have to remember. qlog reads each job's own `Output_Path` / `Error_Path`
 attribute instead, so logs are addressed by job id, never by path.
 
 ```
-$ qlog                      # index: every job's log file
- ID     S  NAME                        SIZE   WRITE PATH
- 193768 R  train_a                   36 KiB     14h …/train_a.o193768
- 194327 R  train_b                  5.5 MiB      0s …/train_b.o194327
- 194367 R  grpo_train.sh              3 KiB     59s …/grpo_train.sh.o194367
+$ qlog                      # index; on a terminal j/k+Enter picks a job to open
+   ID     S  NAME                      SIZE   WRITE PATH
+ 1 193768 R  train_a                 36 KiB     14h …/train_a.o193768
+ 2 194327 R  train_b                5.5 MiB      0s …/train_b.o194327
+ 3 194367 R  grpo_train.sh            3 KiB     59s …/grpo_train.sh.o194367
 
 $ qlog -f                   # live multiplexed stream, one colour per job
- following 4 logs · keys: 1-9 solo · a all · n/p cycle · l list · q quit
  [194367] iter    10  reward mean   -9.08 dB (28.7s/iter)
  [194327] Epoch 0: 28851/? [4:37:26, 1.73it/s, train_step_timing=0.404]
+ a:all  1:193768 vrvq_…  2:194232* orig_…  [3:194327 train…]   n/p cycle · q quit
 
 $ qlog -g "CUDA out of memory" -x -C 2     # search all logs, incl. finished
  194201:8123: torch.cuda.OutOfMemoryError: CUDA out of memory. …
  1 matching line in 1 of 14 logs
 ```
 
-- **`-f` follows every log at once**, each line prefixed `[jobid]`. On a TTY,
-  keys switch focus: `1`–`9` solo one job (its last few unseen lines replay
-  dimmed), `a` back to all, `n`/`p` cycle, `q` quit. `qlog -f <jobid>` streams
-  one job raw, pipeable. `qlog -f -g PATTERN` streams only matching lines.
+- **Bare `qlog` on a terminal is a picker**: `j`/`k` moves the cursor over the
+  index, `Enter` opens that job in follow mode, `1`–`9` opens one directly,
+  `f` follows everything. Piped, it stays a plain table.
+- **`-f` follows every log at once**, each line prefixed `[jobid]`, with a
+  **tab bar pinned under the stream** mapping keys to jobs. The focused tab is
+  highlighted; a `*` appears on any tab whose job printed output while hidden.
+  `1`–`9` solo a job (its last few unseen lines replay dimmed), `j`/`k` or
+  `n`/`p` cycle, `a` back to all, `q` quit. The bar redraws in place under the
+  scrolling log, so scrollback stays intact. `qlog -f <jobid>` streams one job
+  raw, pipeable. `qlog -f -g PATTERN` streams only matching lines.
 - **`\r` progress bars are condensed**: a bar that rewrites its line without a
   newline (tqdm, Lightning) surfaces as a snapshot of its current state every
   few seconds instead of flooding or stalling the stream.
