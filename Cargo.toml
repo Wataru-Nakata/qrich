@@ -1,8 +1,8 @@
 [package]
 name = "qrich"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Rich, visualized qstat for the ABCI-Q PBS Professional cluster"
+description = "Rich, visualized qstat and job-log navigator for the ABCI-Q PBS Professional cluster"
 repository = "https://github.com/Wataru-Nakata/qrich"
 license = "MIT"
 readme = "README.md"

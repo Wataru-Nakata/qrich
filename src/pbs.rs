@@ -111,6 +111,8 @@ pub struct Job {
     pub mem_used_kb: Option<u64>,
     pub nodes: Vec<String>,
     pub log_path: Option<String>,
+    pub error_path: Option<String>,
+    pub join_oe: bool,
     pub qtime: Option<i64>,
     pub stime: Option<i64>,
     pub est_start: Option<String>,
@@ -225,6 +227,14 @@ fn parse_nodes(exec_vnode: &str) -> Vec<String> {
     out
 }
 
+/// `"qes04:/groups/.../x.sh.o190456"` -> drop the submitting-host prefix.
+fn strip_host(p: String) -> String {
+    match p.split_once(':') {
+        Some((_, path)) if path.starts_with('/') => path.to_string(),
+        _ => p,
+    }
+}
+
 pub fn qstat_bin() -> String {
     // Prefer the stock binary: the /usr/local/bin wrapper is fine for -f -F json
     // but the stock one is what the JSON schema is documented against.
@@ -294,7 +304,7 @@ pub fn fetch(history: bool, ids: &[String], tz: i64) -> Result<Snapshot, String>
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if !err.is_empty() {
             let hint = if !ids.is_empty() && !history {
-                "\n       a finished job needs history: `qrich -x <jobid>`"
+                "\n       finished jobs need history: re-run with -x"
             } else {
                 ""
             };
@@ -321,13 +331,10 @@ fn parse_job(id: &str, j: &Value, tz: i64) -> Job {
 
     let short_id = id.split('.').next().unwrap_or(id).to_string();
 
-    let log_path = s(j, "Output_Path").map(|p| {
-        // "qes04:/groups/.../script.sh.o190456" -> strip the host prefix.
-        match p.split_once(':') {
-            Some((_, path)) if path.starts_with('/') => path.to_string(),
-            _ => p,
-        }
-    });
+    let log_path = s(j, "Output_Path").map(strip_host);
+    let error_path = s(j, "Error_Path").map(strip_host);
+    // "oe"/"eo" fold stderr into the output file; "n" keeps a separate .e file.
+    let join_oe = matches!(s(j, "Join_Path").as_deref(), Some("oe") | Some("eo"));
 
     let nodes = s(j, "exec_vnode")
         .map(|v| parse_nodes(&v))
@@ -356,6 +363,8 @@ fn parse_job(id: &str, j: &Value, tz: i64) -> Job {
         mem_used_kb: s(ru, "mem").and_then(|m| fmt::parse_size_kb(&m)),
         nodes,
         log_path,
+        error_path,
+        join_oe,
         qtime: s(j, "qtime").and_then(|d| fmt::parse_pbs_date(&d, tz)),
         stime: s(j, "stime").and_then(|d| fmt::parse_pbs_date(&d, tz)),
         est_start: j

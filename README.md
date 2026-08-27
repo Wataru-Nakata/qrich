@@ -1,6 +1,7 @@
 # qrich
 
-A richer `qstat` for ABCI-Q. Reads `qstat -f -F json` and renders what the plain
+A richer `qstat` for ABCI-Q, plus **qlog**, a navigator for the jobs' logs
+(one install ships both binaries). Reads `qstat -f -F json` and renders what the plain
 table leaves out: GPU count, a walltime progress bar, point burn against the
 group's balance, the node the job landed on, and the log path to tail.
 
@@ -102,6 +103,44 @@ soonest root reservation from `pbs_rstat` — PBS will not start a job whose
 walltime runs into it, which is the usual reason a long job sits queued while
 nodes look free.
 
+## qlog — stream and search job logs
+
+PBS scatters logs across submit directories, and the filename embeds a job id
+you have to remember. qlog reads each job's own `Output_Path` / `Error_Path`
+attribute instead, so logs are addressed by job id, never by path.
+
+```
+$ qlog                      # index: every job's log file
+ ID     S  NAME                        SIZE   WRITE PATH
+ 193768 R  train_a                   36 KiB     14h …/train_a.o193768
+ 194327 R  train_b                  5.5 MiB      0s …/train_b.o194327
+ 194367 R  grpo_train.sh              3 KiB     59s …/grpo_train.sh.o194367
+
+$ qlog -f                   # live multiplexed stream, one colour per job
+ following 4 logs · keys: 1-9 solo · a all · n/p cycle · l list · q quit
+ [194367] iter    10  reward mean   -9.08 dB (28.7s/iter)
+ [194327] Epoch 0: 28851/? [4:37:26, 1.73it/s, train_step_timing=0.404]
+
+$ qlog -g "CUDA out of memory" -x -C 2     # search all logs, incl. finished
+ 194201:8123: torch.cuda.OutOfMemoryError: CUDA out of memory. …
+ 1 matching line in 1 of 14 logs
+```
+
+- **`-f` follows every log at once**, each line prefixed `[jobid]`. On a TTY,
+  keys switch focus: `1`–`9` solo one job (its last few unseen lines replay
+  dimmed), `a` back to all, `n`/`p` cycle, `q` quit. `qlog -f <jobid>` streams
+  one job raw, pipeable. `qlog -f -g PATTERN` streams only matching lines.
+- **`\r` progress bars are condensed**: a bar that rewrites its line without a
+  newline (tqdm, Lightning) surfaces as a snapshot of its current state every
+  few seconds instead of flooding or stalling the stream.
+- **`-g` searches** every log with plain substring matching (`-i` for
+  ASCII-case-insensitive, `-C N` for context). Exits 0 on a hit, 1 on none,
+  grep-style.
+- Logs that don't exist yet are announced and picked up the moment the job
+  starts writing — submit, run `qlog -f`, and wait. A running job with no log
+  usually lacks `#PBS -k oed` (output stays spooled until the job ends).
+- Jobs without `-j oe` get their separate stderr as an extra `<jobid>.e` entry.
+
 ## Point rates
 
 Figures use the 特別支援課題利用 (Special Support) rate card — rt_QF 5, rt_QG 2,
@@ -129,7 +168,8 @@ those.
 
 | File | Role |
 |---|---|
-| `src/main.rs` | argument parsing, job filtering/sorting, watch loop |
+| `src/main.rs` | qrich: argument parsing, job filtering/sorting, watch loop |
+| `src/bin/qlog.rs` | qlog: log index, multiplexed follow, search |
 | `src/pbs.rs` | running `qstat`/`show_point`, JSON → `Job`, point rates |
 | `src/render.rs` | responsive table, long cards, footer warnings |
 | `src/fmt.rs` | PBS durations, sizes, timestamps, bars, padding |

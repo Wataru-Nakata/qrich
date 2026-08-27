@@ -524,6 +524,13 @@ fn card(j: &Job, view: &View, groups: &[String]) -> String {
     if let Some(p) = &j.log_path {
         out.push_str(&format!("   {} {}\n", view.dim("log     "), p));
     }
+    if !j.join_oe {
+        if let Some(e) = &j.error_path {
+            if j.log_path.as_deref() != Some(e.as_str()) {
+                out.push_str(&format!("   {} {}\n", view.dim("errlog  "), e));
+            }
+        }
+    }
     if let Some(a) = &j.submit_args {
         out.push_str(&format!("   {} {}\n", view.dim("submit  "), a));
     }
