@@ -2,9 +2,9 @@
 //!
 //! Companion binary to qrich, sharing its PBS plumbing. Jobs are addressed by
 //! id: each job's own Output_Path / Error_Path attribute says where its log
-//! lives, so you never hunt for paths. Three modes: an index of every job's
-//! log file, a multiplexed live stream with a tab bar and key-switchable
-//! focus, and a substring search across all logs.
+//! lives, so you never hunt for paths. Modes: an index of every job's log
+//! file (a j/k picker on a terminal), a paged full-screen live view with one
+//! page per job, and a substring search across all logs.
 
 #![allow(dead_code)]
 
@@ -14,7 +14,7 @@ mod fmt;
 mod pbs;
 
 use pbs::Job;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc;
@@ -28,19 +28,23 @@ USAGE:
 
 MODES:
     (default)               index of every job's log file; on a terminal, j/k
-                            moves a cursor and Enter opens that job in follow
-                            mode (piped output stays a plain table)
-    -f, --follow            stream logs live; each line is prefixed [jobid] and
-                            a tab bar at the bottom maps keys to jobs:
-                            1-9 solo a job · j/k or n/p cycle · a all · q quit
-                            (* on a tab = output arrived while it was hidden)
+                            moves a cursor and Enter opens that job's page
+                            (piped output stays a plain table)
+    -f, --follow            full-screen live view: one page per job plus an
+                            \"all\" page, each with a title bar and a tab bar.
+                            1-9 page · j/k or n/p cycle · a all · u/d scroll
+                            g oldest · G tail · q quit
+                            (* on a tab = output arrived on a hidden page)
+                            Piped, it degrades to a plain [jobid]-prefixed
+                            stream.
     -g, --grep PATTERN      search the logs (plain substring, no regex)
     -p, --paths             print log paths only (for less/vim/scp)
 
 OPTIONS:
     -i, --ignore-case       case-insensitive search (ASCII)
     -C, --context N         context lines around matches (default 0)
-    -n, --tail N            backlog lines per log when following (default 10)
+    -n, --tail N            backlog lines per log (default 10 piped, a full
+                            page in the live view)
     -x, --history           include recently finished jobs
     -a, --all               every user's jobs, not just your own
     -u, --user USER         jobs owned by USER
@@ -64,6 +68,7 @@ struct Opts {
     icase: bool,
     context: usize,
     tail: usize,
+    tail_set: bool,
     history: bool,
     all_users: bool,
     user: Option<String>,
@@ -71,6 +76,7 @@ struct Opts {
     color: Option<bool>,
     width: Option<usize>,
     bar_preview: bool,
+    page_preview: bool,
     ids: Vec<String>,
 }
 
@@ -81,6 +87,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
         icase: false,
         context: 0,
         tail: 10,
+        tail_set: false,
         history: false,
         all_users: false,
         user: None,
@@ -88,6 +95,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
         color: None,
         width: None,
         bar_preview: false,
+        page_preview: false,
         ids: Vec::new(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -109,6 +117,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
             "-x" | "--history" => o.history = true,
             "-a" | "--all" => o.all_users = true,
             "--bar-preview" => o.bar_preview = true, // hidden: render the tab bar once
+            "--page-preview" => o.page_preview = true, // hidden: render one page frame
             "-g" | "--grep" => {
                 i += 1;
                 o.grep = Some(args.get(i).ok_or("--grep needs a pattern")?.clone());
@@ -132,6 +141,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
                     .ok_or("--tail needs a number")?
                     .parse()
                     .map_err(|_| "--tail needs a number")?;
+                o.tail_set = true;
             }
             "--color" => {
                 i += 1;
@@ -296,6 +306,51 @@ fn display_bytes(mut b: &[u8]) -> String {
     }
 }
 
+/// Display width of one char: CJK and fullwidth count as 2 columns.
+fn char_width(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F        // Hangul Jamo
+        | 0x2E80..=0xA4CF      // CJK radicals .. Yi
+        | 0xAC00..=0xD7A3      // Hangul syllables
+        | 0xF900..=0xFAFF      // CJK compat ideographs
+        | 0xFE30..=0xFE4F      // CJK compat forms
+        | 0xFF00..=0xFF60      // fullwidth forms
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+fn disp_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// Truncate to at most `max` display columns, marking elision.
+fn truncate_w(s: &str, max: usize) -> String {
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Pad with spaces to exactly `width` display columns (truncating if over).
+fn pad_w(s: &str, width: usize) -> String {
+    let t = truncate_w(s, width);
+    let w = disp_width(&t);
+    format!("{}{}", t, " ".repeat(width.saturating_sub(w)))
+}
+
 /// Path shortened from the front — the filename end is the part that matters.
 fn ellipsize_front(s: &str, max: usize) -> String {
     let n = s.chars().count();
@@ -322,13 +377,35 @@ fn ago(m: SystemTime) -> String {
     }
 }
 
+/// Terminal (rows, cols) via `stty size`; honors a --width override for cols.
+fn term_size(width_override: Option<usize>) -> (usize, usize) {
+    let mut rows = 30usize;
+    let mut cols = 100usize;
+    if let Ok(out) = Command::new("stty")
+        .arg("size")
+        .stdin(Stdio::inherit())
+        .output()
+    {
+        let t = String::from_utf8_lossy(&out.stdout);
+        let mut it = t.split_whitespace();
+        if let (Some(r), Some(c)) = (it.next(), it.next()) {
+            rows = r.parse().unwrap_or(30);
+            cols = c.parse().unwrap_or(100);
+        }
+    }
+    if let Some(w) = width_override {
+        cols = w;
+    }
+    (rows.max(5), cols.max(40))
+}
+
 // ---------------------------------------------------------------------------
-// list mode
+// index table, list mode, picker
 // ---------------------------------------------------------------------------
 
 /// The index table: header plus, per target, a colored row and a plain
 /// (uncolored) twin the picker can reverse-video as its cursor. The leading
-/// digit is the job's key in the picker and the follow-mode tab bar.
+/// digit is the job's key in the picker and the live view's tab bar.
 fn build_rows(targets: &[Target], pal: Pal, width: usize) -> (String, Vec<(String, String)>) {
     let label_w = targets
         .iter()
@@ -393,16 +470,10 @@ fn build_rows(targets: &[Target], pal: Pal, width: usize) -> (String, Vec<(Strin
 fn list(targets: &[Target], pal: Pal, width: usize) {
     let (header, rows) = build_rows(targets, pal, width);
     put(&format!("{header}\n"));
-    let mut missing = false;
     for (colored, _) in &rows {
         put(&format!("{colored}\n"));
     }
-    for t in targets {
-        if std::fs::metadata(&t.path).is_err() {
-            missing = true;
-        }
-    }
-    if missing {
+    if targets.iter().any(|t| std::fs::metadata(&t.path).is_err()) {
         put(&format!(
             " {}\n",
             pal.dim("- = no file yet: job not started, or output spooled without #PBS -k oed")
@@ -414,8 +485,8 @@ fn list(targets: &[Target], pal: Pal, width: usize) {
     ));
 }
 
-/// Interactive index: j/k moves a cursor over the rows, Enter opens that job
-/// in follow mode, 1-9 opens a job directly. Returns the chosen job index.
+/// Interactive index: j/k moves a cursor over the rows, Enter opens that job's
+/// page, 1-9 opens a job directly, f opens the "all" page.
 fn picker(targets: &[Target], nj: usize, pal: Pal, width: usize, keys: &Keys) -> Option<usize> {
     let (header, rows) = build_rows(targets, pal, width);
     put(&format!("{header}\n"));
@@ -462,7 +533,7 @@ fn picker(targets: &[Target], nj: usize, pal: Pal, width: usize, keys: &Keys) ->
                     }
                 }
                 b'\r' | b'\n' => return Some(targets[cursor].jidx),
-                b'f' | b'a' => return Some(usize::MAX), // follow all
+                b'f' | b'a' => return Some(usize::MAX), // the "all" page
                 b'1'..=b'9' => {
                     let j = (k - b'1') as usize;
                     if j < nj {
@@ -599,7 +670,7 @@ fn search_file(
 }
 
 // ---------------------------------------------------------------------------
-// follow mode
+// raw terminal plumbing
 // ---------------------------------------------------------------------------
 
 /// Restores the terminal with the settings saved at construction.
@@ -636,9 +707,26 @@ impl Drop for RawGuard {
     }
 }
 
-/// One raw-mode stdin session shared by the picker and follow mode — a single
-/// reader thread for the whole process, so handing off between modes never
-/// leaves a second reader stealing keystrokes.
+/// Alternate screen + hidden cursor; the previous screen (and scrollback)
+/// comes back untouched on drop.
+struct ScreenGuard;
+
+impl ScreenGuard {
+    fn new() -> ScreenGuard {
+        put("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        ScreenGuard
+    }
+}
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        put("\x1b[?25h\x1b[?1049l");
+    }
+}
+
+/// One raw-mode stdin session shared by the picker and the live view — a
+/// single reader thread for the whole process, so handing off between modes
+/// never leaves a second reader stealing keystrokes.
 struct Keys {
     rx: mpsc::Receiver<u8>,
     interactive: bool,
@@ -679,17 +767,34 @@ impl Keys {
     }
 }
 
+// ---------------------------------------------------------------------------
+// log streaming
+// ---------------------------------------------------------------------------
+
 struct Stream<'a> {
     t: &'a Target<'a>,
     offset: u64,
     buf: Vec<u8>,
     opened: bool,
     wait_announced: bool,
-    ring: VecDeque<String>,
     last_partial: Instant,
 }
 
-const TAIL_SCAN: u64 = 1 << 16; // how far back the initial backlog looks
+fn make_streams<'a>(targets: &'a [Target<'a>]) -> Vec<Stream<'a>> {
+    targets
+        .iter()
+        .map(|t| Stream {
+            t,
+            offset: 0,
+            buf: Vec::new(),
+            opened: false,
+            wait_announced: false,
+            last_partial: Instant::now(),
+        })
+        .collect()
+}
+
+const TAIL_SCAN: u64 = 1 << 18; // how far back the initial backlog looks
 const MAX_READ: usize = 1 << 21; // per stream per poll
 
 /// New display lines from one log; `.1` marks status lines (shown dim).
@@ -776,60 +881,13 @@ fn poll_stream(s: &mut Stream, tail_n: usize) -> Vec<(String, bool)> {
     out
 }
 
-/// One formatted output line (with trailing newline).
-fn line_out(
-    pal: Pal,
-    prefix_on: bool,
-    label_w: usize,
-    t: &Target,
-    line: &str,
-    sys: bool,
-    grep: Option<(&str, bool)>,
-) -> String {
-    let body = if sys {
-        pal.dim(line)
-    } else if let Some((p, ic)) = grep {
-        highlight(pal, line, p, ic)
-    } else {
-        line.to_string()
-    };
-    if prefix_on {
-        format!(
-            "{} {}\n",
-            pal.c(t.color, &format!("[{}]", fmt::pad(&t.label, label_w))),
-            body
-        )
-    } else {
-        format!("{body}\n")
-    }
-}
+// ---------------------------------------------------------------------------
+// live view (paged TUI)
+// ---------------------------------------------------------------------------
 
-fn banner_str(pal: Pal, txt: &str) -> String {
-    format!(" {}\n", pal.dim(&format!("── {txt} ──")))
-}
-
-fn mapping_str(jobs: &[&Job], pal: Pal) -> String {
-    let mut out = String::new();
-    for (i, j) in jobs.iter().take(9).enumerate() {
-        out.push_str(&format!(
-            "  {} {} {}\n",
-            pal.c("1", &(i + 1).to_string()),
-            pal.c(JOB_COLORS[i % JOB_COLORS.len()], &j.short_id),
-            pal.dim(&fmt::ellipsize(&j.name, 48)),
-        ));
-    }
-    if jobs.len() > 9 {
-        out.push_str(&format!(
-            "  {}\n",
-            pal.dim(&format!("(+{} more — n/p cycles through all)", jobs.len() - 9))
-        ));
-    }
-    out
-}
-
-/// The persistent bottom bar: which key is which job, which tab is focused,
-/// `*` on tabs that produced output while hidden. Fits `width` by shrinking
-/// names, then dropping the hint, then dropping trailing tabs.
+/// The tab bar: which key is which job, which page is focused, `*` on tabs
+/// whose job printed while hidden. Fits `width` by shrinking names, then
+/// dropping the hint, then dropping trailing tabs — never the focused one.
 fn tab_bar(pal: Pal, jobs: &[&Job], solo: Option<usize>, activity: &[bool], width: usize) -> String {
     let n = jobs.len();
     let key_of = |i: usize| {
@@ -839,9 +897,8 @@ fn tab_bar(pal: Pal, jobs: &[&Job], solo: Option<usize>, activity: &[bool], widt
             "·".to_string()
         }
     };
-    let hint = "n/p cycle · q quit";
+    let hint = "j/k page · u/d scroll · q quit";
 
-    // Plain-text length of one tab at a given name budget.
     let plain_len = |i: usize, name_w: usize| {
         let mut l = key_of(i).chars().count() + 1 + jobs[i].short_id.chars().count();
         if activity[i] {
@@ -875,8 +932,6 @@ fn tab_bar(pal: Pal, jobs: &[&Job], solo: Option<usize>, activity: &[bool], widt
         hint_on = false;
     }
 
-    // A tab: highlighted block when focused, colored id otherwise. Without
-    // color the focused tab is bracketed instead.
     let tab = |i: usize| -> String {
         let color = JOB_COLORS[i % JOB_COLORS.len()];
         let star = if activity[i] { "*" } else { "" };
@@ -939,7 +994,202 @@ fn tab_bar(pal: Pal, jobs: &[&Job], solo: Option<usize>, activity: &[bool], widt
     out
 }
 
-fn follow(
+/// A buffered line: which target produced it, its text, and whether it is a
+/// status message rather than log content.
+type Entry = (usize, String, bool);
+
+/// Full-width title bar for a page: identity on the left, live job facts
+/// beside it, scroll state when not tailing.
+fn title_bar(
+    pal: Pal,
+    jobs: &[&Job],
+    targets: &[Target],
+    page: usize,
+    scroll: usize,
+    new_below: usize,
+    cols: usize,
+    rates: &HashMap<String, f64>,
+) -> String {
+    let nj = jobs.len();
+    let scroll_note = if scroll > 0 {
+        let below = if new_below > 0 {
+            format!(" · {new_below} new below")
+        } else {
+            String::new()
+        };
+        format!("  ↑{scroll}{below} — G to tail")
+    } else {
+        String::new()
+    };
+
+    let (plain, color) = if page >= nj {
+        (
+            format!(
+                " ◆ all logs — {} job{} · {} file{}{}",
+                nj,
+                if nj == 1 { "" } else { "s" },
+                targets.len(),
+                if targets.len() == 1 { "" } else { "s" },
+                scroll_note
+            ),
+            "7;1".to_string(),
+        )
+    } else {
+        let j = jobs[page];
+        let gpus = if j.ngpus > 0 {
+            format!(" · {} GPU", j.ngpus)
+        } else {
+            String::new()
+        };
+        let wall = match (j.walltime_frac(), j.walltime_used, j.walltime_req) {
+            (Some(f), Some(u), Some(r)) => {
+                format!(" · wall {:.0}% ({}/{})", f * 100.0, fmt::hm(u), fmt::hm(r))
+            }
+            _ => String::new(),
+        };
+        let pts = match (j.points_spent(rates), j.points_reserved(rates)) {
+            (Some(sp), Some(rv)) => format!(" · {}/{} pt", fmt::points(sp), fmt::points(rv)),
+            _ => String::new(),
+        };
+        let node = if j.nodes.is_empty() {
+            String::new()
+        } else if j.nodes.len() == 1 {
+            format!(" · {}", j.nodes[0])
+        } else {
+            format!(" · {}+{}", j.nodes[0], j.nodes.len() - 1)
+        };
+        (
+            format!(
+                " ● {} {} — {} · {}{}{}{}{}{}",
+                j.short_id,
+                j.name,
+                j.state.label(),
+                j.resource_label(),
+                gpus,
+                wall,
+                pts,
+                node,
+                scroll_note
+            ),
+            format!("7;1;{}", JOB_COLORS[page % JOB_COLORS.len()]),
+        )
+    };
+    pal.c(&color, &pad_w(&plain, cols))
+}
+
+/// Render one buffered entry into at most `cols` columns.
+fn render_entry(
+    pal: Pal,
+    targets: &[Target],
+    entry: &Entry,
+    all_page: bool,
+    label_w: usize,
+    job_multi: &[bool],
+    cols: usize,
+    grep: Option<(&str, bool)>,
+) -> String {
+    let (ti, line, sys) = entry;
+    let t = &targets[*ti];
+    let (prefix, avail) = if all_page {
+        (
+            format!(
+                "{} ",
+                pal.c(t.color, &format!("[{}]", fmt::pad(&t.label, label_w)))
+            ),
+            cols.saturating_sub(label_w + 3).max(10),
+        )
+    } else if job_multi[t.jidx] && t.label.ends_with(".e") {
+        (pal.c("31", "▎"), cols.saturating_sub(1).max(10))
+    } else {
+        (String::new(), cols)
+    };
+    let body = truncate_w(line, avail);
+    let body = if *sys {
+        pal.dim(&body)
+    } else if let Some((p, ic)) = grep {
+        highlight(pal, &body, p, ic)
+    } else {
+        body
+    };
+    format!("{prefix}{body}")
+}
+
+/// One full frame: title bar, content window, tab bar.
+#[allow(clippy::too_many_arguments)]
+fn paint_frame(
+    pal: Pal,
+    jobs: &[&Job],
+    targets: &[Target],
+    bufs: &[VecDeque<Entry>],
+    page: usize,
+    scroll: usize,
+    new_below: usize,
+    activity: &[bool],
+    rows: usize,
+    cols: usize,
+    grep: Option<(&str, bool)>,
+    rates: &HashMap<String, f64>,
+) -> String {
+    let nj = jobs.len();
+    let content_h = rows.saturating_sub(2).max(1);
+    let label_w = targets
+        .iter()
+        .map(|t| t.label.chars().count())
+        .max()
+        .unwrap_or(6);
+    let mut multi = vec![0usize; nj];
+    for t in targets {
+        multi[t.jidx] += 1;
+    }
+    let job_multi: Vec<bool> = multi.iter().map(|c| *c > 1).collect();
+
+    let buf = &bufs[page.min(nj)];
+    let total = buf.len();
+    let max_scroll = total.saturating_sub(content_h);
+    let scroll = scroll.min(max_scroll);
+    let end = total - scroll;
+    let start = end.saturating_sub(content_h);
+
+    let mut out = String::from("\x1b[H");
+    out.push_str(&title_bar(
+        pal, jobs, targets, page, scroll, new_below, cols, rates,
+    ));
+    out.push_str("\r\n");
+    for entry in buf.iter().skip(start).take(end - start) {
+        out.push_str("\x1b[2K");
+        out.push_str(&render_entry(
+            pal,
+            targets,
+            entry,
+            page >= nj,
+            label_w,
+            &job_multi,
+            cols,
+            grep,
+        ));
+        out.push_str("\r\n");
+    }
+    for _ in (end - start)..content_h {
+        out.push_str("\x1b[2K\r\n");
+    }
+    out.push_str(&format!("\x1b[{rows};1H\x1b[2K"));
+    let solo = if page < nj { Some(page) } else { None };
+    out.push_str(&tab_bar(pal, jobs, solo, activity, cols));
+    out
+}
+
+const BUF_CAP_JOB: usize = 4000;
+const BUF_CAP_ALL: usize = 8000;
+
+fn push_capped(buf: &mut VecDeque<Entry>, e: Entry, cap: usize) {
+    buf.push_back(e);
+    if buf.len() > cap {
+        buf.pop_front();
+    }
+}
+
+/// The paged live view: alt screen, one page per job plus an "all" page.
+fn follow_tui(
     jobs: &[&Job],
     targets: &[Target],
     o: &Opts,
@@ -947,124 +1197,31 @@ fn follow(
     initial_solo: Option<usize>,
     keys: &Keys,
 ) {
-    if targets.is_empty() {
-        eprintln!("qlog: no logs to follow (no jobs, or all logs at /dev/null)");
-        return;
-    }
-    let interactive = keys.interactive;
-    let label_w = targets
-        .iter()
-        .map(|t| t.label.chars().count())
-        .max()
-        .unwrap_or(6);
-    let prefix_on = targets.len() > 1;
-    let grep = o.grep.as_deref();
     let nj = jobs.len();
+    let all_page = nj;
+    let mut page = initial_solo.unwrap_or(all_page);
+    let mut scroll = 0usize;
+    let mut new_below = 0usize;
+    let mut activity = vec![false; nj];
+    let mut bufs: Vec<VecDeque<Entry>> = (0..=nj).map(|_| VecDeque::new()).collect();
+    let mut streams = make_streams(targets);
+    let grep = o.grep.as_deref().map(|p| (p, o.icase));
+    let rates = pbs::point_rates();
 
-    let mut width = o.width.unwrap_or_else(pbs::term_width);
-    let mut last_width_check = Instant::now();
-    let mut activity: Vec<bool> = vec![false; nj];
-    let mut bar_shown = false;
-    let mut solo: Option<usize> = initial_solo;
-    let mut batch = String::new();
-
-    batch.push_str(&format!(
-        " {}\n",
-        pal.dim(&format!(
-            "following {} log{} · {}",
-            targets.len(),
-            if targets.len() == 1 { "" } else { "s" },
-            if interactive {
-                "keys: 1-9 solo · a all · n/p cycle · l list · q quit"
-            } else {
-                "Ctrl-C to stop"
-            }
-        ))
-    ));
-    if let Some(j) = initial_solo {
-        batch.push_str(&banner_str(
-            pal,
-            &format!("{} {}", jobs[j].short_id, jobs[j].name),
-        ));
-    }
-
-    // Erase the old bar (if any), print the batch, redraw the bar underneath.
-    // The bar is always the last line on screen and never enters a log line's
-    // way, so ordinary scrollback stays intact.
-    let flush = |batch: &mut String,
-                 bar_shown: &mut bool,
-                 solo: Option<usize>,
-                 activity: &mut [bool],
-                 width: usize| {
-        let mut out = String::new();
-        if *bar_shown {
-            out.push_str("\r\x1b[2K");
-            *bar_shown = false;
-        }
-        out.push_str(batch);
-        batch.clear();
-        if interactive {
-            match solo {
-                None => activity.iter_mut().for_each(|a| *a = false),
-                Some(j) => activity[j] = false,
-            }
-            out.push_str(&tab_bar(pal, jobs, solo, activity, width));
-            *bar_shown = true;
-        }
-        put(&out);
+    let (mut rows, mut cols) = term_size(o.width);
+    let mut last_size = Instant::now();
+    // Seed enough backlog to fill a page unless the user chose a depth.
+    let tail_n = if o.tail_set {
+        o.tail
+    } else {
+        (rows.saturating_sub(2)).max(o.tail) * 2
     };
-    flush(&mut batch, &mut bar_shown, solo, &mut activity, width);
 
-    let mut streams: Vec<Stream> = targets
-        .iter()
-        .map(|t| Stream {
-            t,
-            offset: 0,
-            buf: Vec::new(),
-            opened: false,
-            wait_announced: false,
-            ring: VecDeque::new(),
-            last_partial: Instant::now(),
-        })
-        .collect();
+    let _screen = ScreenGuard::new();
+    let mut dirty = true;
 
     'outer: loop {
-        let mut bar_dirty = false;
-
-        let switch = |to: Option<usize>,
-                          solo: &mut Option<usize>,
-                          batch: &mut String,
-                          streams: &mut [Stream]| {
-            *solo = to;
-            match to {
-                None => batch.push_str(&banner_str(pal, "all logs")),
-                Some(j) => {
-                    batch.push_str(&banner_str(
-                        pal,
-                        &format!("{} {}", jobs[j].short_id, jobs[j].name),
-                    ));
-                    let mut any = false;
-                    for s in streams.iter_mut().filter(|s| s.t.jidx == j) {
-                        any = true;
-                        for l in s.ring.drain(..) {
-                            batch.push_str(&line_out(
-                                pal,
-                                prefix_on,
-                                label_w,
-                                s.t,
-                                &pal.dim(&l),
-                                true,
-                                None,
-                            ));
-                        }
-                    }
-                    if !any {
-                        batch.push_str(&format!(" {}\n", pal.dim("(no log files for this job)")));
-                    }
-                }
-            }
-        };
-
+        let content_h = rows.saturating_sub(2).max(1);
         match keys.rx.recv_timeout(Duration::from_millis(400)) {
             Ok(first) => {
                 let mut pressed = vec![first];
@@ -1072,32 +1229,55 @@ fn follow(
                     pressed.push(b);
                 }
                 for k in pressed {
+                    let max_scroll = bufs[page].len().saturating_sub(content_h);
                     match k {
                         b'q' | 3 | 4 | 27 => break 'outer, // q, ^C, ^D, Esc
                         b'a' | b'0' => {
-                            switch(None, &mut solo, &mut batch, &mut streams);
-                            bar_dirty = true;
+                            page = all_page;
+                            scroll = 0;
+                            new_below = 0;
+                            dirty = true;
                         }
                         b'1'..=b'9' => {
                             let j = (k - b'1') as usize;
                             if j < nj {
-                                switch(Some(j), &mut solo, &mut batch, &mut streams);
-                                bar_dirty = true;
+                                page = j;
+                                scroll = 0;
+                                new_below = 0;
+                                dirty = true;
                             }
                         }
-                        b'n' | b'j' => {
-                            let j = solo.map_or(0, |j| (j + 1) % nj);
-                            switch(Some(j), &mut solo, &mut batch, &mut streams);
-                            bar_dirty = true;
+                        b'j' | b'n' => {
+                            page = (page + 1) % (nj + 1);
+                            scroll = 0;
+                            new_below = 0;
+                            dirty = true;
                         }
-                        b'p' | b'k' => {
-                            let j = solo.map_or(nj - 1, |j| (j + nj - 1) % nj);
-                            switch(Some(j), &mut solo, &mut batch, &mut streams);
-                            bar_dirty = true;
+                        b'k' | b'p' => {
+                            page = (page + nj) % (nj + 1);
+                            scroll = 0;
+                            new_below = 0;
+                            dirty = true;
                         }
-                        b'l' => {
-                            batch.push_str(&mapping_str(jobs, pal));
-                            bar_dirty = true;
+                        b'u' => {
+                            scroll = (scroll + content_h / 2).min(max_scroll);
+                            dirty = true;
+                        }
+                        b'd' => {
+                            scroll = scroll.saturating_sub(content_h / 2);
+                            if scroll == 0 {
+                                new_below = 0;
+                            }
+                            dirty = true;
+                        }
+                        b'g' => {
+                            scroll = max_scroll;
+                            dirty = true;
+                        }
+                        b'G' => {
+                            scroll = 0;
+                            new_below = 0;
+                            dirty = true;
                         }
                         _ => {}
                     }
@@ -1110,8 +1290,91 @@ fn follow(
         }
 
         for i in 0..streams.len() {
-            let visible = solo.map_or(true, |j| streams[i].t.jidx == j);
-            for (line, sys) in poll_stream(&mut streams[i], o.tail) {
+            let jidx = streams[i].t.jidx;
+            for (line, sys) in poll_stream(&mut streams[i], tail_n) {
+                if !sys {
+                    if let Some((p, ic)) = grep {
+                        if find_ci(line.as_bytes(), p.as_bytes(), ic).is_none() {
+                            continue;
+                        }
+                    }
+                }
+                push_capped(&mut bufs[jidx], (i, line.clone(), sys), BUF_CAP_JOB);
+                push_capped(&mut bufs[all_page], (i, line, sys), BUF_CAP_ALL);
+                let visible = page == all_page || page == jidx;
+                if visible {
+                    if scroll == 0 {
+                        dirty = true;
+                    } else {
+                        new_below += 1;
+                        dirty = true; // title shows the growing count
+                    }
+                } else if !sys && !activity[jidx] {
+                    activity[jidx] = true;
+                    dirty = true;
+                }
+            }
+        }
+
+        if last_size.elapsed() >= Duration::from_secs(5) {
+            let ns = term_size(o.width);
+            if ns != (rows, cols) {
+                (rows, cols) = ns;
+                dirty = true;
+            }
+            last_size = Instant::now();
+        }
+
+        if dirty {
+            if page < nj {
+                activity[page] = false;
+            } else {
+                activity.iter_mut().for_each(|a| *a = false);
+            }
+            put(&paint_frame(
+                pal, jobs, targets, &bufs, page, scroll, new_below, &activity, rows, cols, grep,
+                &rates,
+            ));
+            dirty = false;
+        }
+    }
+    // _screen drop restores the previous screen; Keys' RawGuard restores stty.
+}
+
+/// Piped follow: a plain multiplexed stream, no screen control at all.
+fn follow_pipe(targets: &[Target], o: &Opts, pal: Pal, keys: &Keys) {
+    let label_w = targets
+        .iter()
+        .map(|t| t.label.chars().count())
+        .max()
+        .unwrap_or(6);
+    let prefix_on = targets.len() > 1;
+    let grep = o.grep.as_deref();
+    let mut streams = make_streams(targets);
+
+    put(&format!(
+        " {}\n",
+        pal.dim(&format!(
+            "following {} log{} · Ctrl-C to stop",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" }
+        ))
+    ));
+
+    loop {
+        // The channel never disconnects (Keys holds a sender), so this is a
+        // plain 400ms tick.
+        match keys.rx.recv_timeout(Duration::from_millis(400)) {
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+        let mut batch = String::new();
+        for s in streams.iter_mut() {
+            let t = s.t;
+            for (line, sys) in poll_stream(s, o.tail) {
                 if !sys {
                     if let Some(p) = grep {
                         if find_ci(line.as_bytes(), p.as_bytes(), o.icase).is_none() {
@@ -1119,42 +1382,46 @@ fn follow(
                         }
                     }
                 }
-                if visible {
-                    batch.push_str(&line_out(
-                        pal,
-                        prefix_on,
-                        label_w,
-                        streams[i].t,
-                        &line,
-                        sys,
-                        grep.map(|p| (p, o.icase)),
+                let body = if sys {
+                    pal.dim(&line)
+                } else if let Some(p) = grep {
+                    highlight(pal, &line, p, o.icase)
+                } else {
+                    line
+                };
+                if prefix_on {
+                    batch.push_str(&format!(
+                        "{} {}\n",
+                        pal.c(t.color, &format!("[{}]", fmt::pad(&t.label, label_w))),
+                        body
                     ));
-                } else if !sys {
-                    let jidx = streams[i].t.jidx;
-                    if !activity[jidx] {
-                        activity[jidx] = true;
-                        bar_dirty = true; // a star appeared
-                    }
-                    let ring = &mut streams[i].ring;
-                    ring.push_back(line);
-                    if ring.len() > 6 {
-                        ring.pop_front();
-                    }
+                } else {
+                    batch.push_str(&format!("{body}\n"));
                 }
             }
         }
-
-        if !batch.is_empty() || bar_dirty {
-            if o.width.is_none() && last_width_check.elapsed() >= Duration::from_secs(5) {
-                width = pbs::term_width();
-                last_width_check = Instant::now();
-            }
-            flush(&mut batch, &mut bar_shown, solo, &mut activity, width);
+        if !batch.is_empty() {
+            put(&batch);
         }
     }
+}
 
-    if bar_shown {
-        put("\r\x1b[2K");
+fn follow(
+    jobs: &[&Job],
+    targets: &[Target],
+    o: &Opts,
+    pal: Pal,
+    initial_solo: Option<usize>,
+    keys: &Keys,
+) {
+    if targets.is_empty() {
+        eprintln!("qlog: no logs to follow (no jobs, or all logs at /dev/null)");
+        return;
+    }
+    if keys.interactive {
+        follow_tui(jobs, targets, o, pal, initial_solo, keys);
+    } else {
+        follow_pipe(targets, o, pal, keys);
     }
 }
 
@@ -1208,7 +1475,7 @@ fn main() -> ExitCode {
     let targets = build_targets(&jobs);
 
     if o.bar_preview {
-        // Hidden test hook: render the bar in a few states without a TTY.
+        // Hidden test hook: render the tab bar in a few states without a TTY.
         if jobs.is_empty() {
             eprintln!("qlog: no jobs");
             return ExitCode::FAILURE;
@@ -1226,13 +1493,36 @@ fn main() -> ExitCode {
         ));
         return ExitCode::SUCCESS;
     }
-    if o.paths {
+    if o.page_preview {
+        // Hidden test hook: seed buffers from the logs' tails and print one
+        // frame per page kind, with cursor addressing stripped.
         if targets.is_empty() {
-            eprintln!("qlog: no log paths");
+            eprintln!("qlog: no logs");
             return ExitCode::FAILURE;
         }
-        for t in &targets {
-            put(&format!("{}\n", t.path));
+        let (rows, cols) = (20usize, o.width.unwrap_or(100));
+        let nj = jobs.len();
+        let mut bufs: Vec<VecDeque<Entry>> = (0..=nj).map(|_| VecDeque::new()).collect();
+        let mut streams = make_streams(&targets);
+        for i in 0..streams.len() {
+            let jidx = streams[i].t.jidx;
+            for (line, sys) in poll_stream(&mut streams[i], rows) {
+                push_capped(&mut bufs[jidx], (i, line.clone(), sys), BUF_CAP_JOB);
+                push_capped(&mut bufs[nj], (i, line, sys), BUF_CAP_ALL);
+            }
+        }
+        let activity = vec![false; nj];
+        let rates = pbs::point_rates();
+        for page in [0usize, nj] {
+            let frame = paint_frame(
+                pal, &jobs, &targets, &bufs, page, 0, 0, &activity, rows, cols, None, &rates,
+            );
+            let clean = frame
+                .replace("\x1b[H", "")
+                .replace("\x1b[2K", "")
+                .replace(&format!("\x1b[{rows};1H"), "")
+                .replace("\r\n", "\n");
+            put(&format!("{clean}\n{}\n", "═".repeat(cols.min(60))));
         }
         return ExitCode::SUCCESS;
     }

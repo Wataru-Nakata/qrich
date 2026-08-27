@@ -116,10 +116,13 @@ $ qlog                      # index; on a terminal j/k+Enter picks a job to open
  2 194327 R  train_b                5.5 MiB      0s …/train_b.o194327
  3 194367 R  grpo_train.sh            3 KiB     59s …/grpo_train.sh.o194367
 
-$ qlog -f                   # live multiplexed stream, one colour per job
- [194367] iter    10  reward mean   -9.08 dB (28.7s/iter)
- [194327] Epoch 0: 28851/? [4:37:26, 1.73it/s, train_step_timing=0.404]
- a:all  1:193768 vrvq_…  2:194232* orig_…  [3:194327 train…]   n/p cycle · q quit
+$ qlog -f                   # full-screen live view, one page per job
+ ● 193768 vrvq_after150 — running · rt_QF · 4 GPU · wall 34% (16:08/48:00) · 81/240 pt · qh391
+ [rank1] W0827 11:58:47 torch/_dynamo/convert_frame.py ...
+ Loading weights: 100%|██████████| 552/552 [00:00, 3105.86it/s]
+ iter    10  reward mean   -4.33 dB   KL/step  1.2 (14.2s/iter)
+ …log fills the screen…
+ a:all  [1:193768 vrvq_…]  2:194232* orig_…  3:194327 train…   j/k page · u/d scroll · q quit
 
 $ qlog -g "CUDA out of memory" -x -C 2     # search all logs, incl. finished
  194201:8123: torch.cuda.OutOfMemoryError: CUDA out of memory. …
@@ -127,15 +130,21 @@ $ qlog -g "CUDA out of memory" -x -C 2     # search all logs, incl. finished
 ```
 
 - **Bare `qlog` on a terminal is a picker**: `j`/`k` moves the cursor over the
-  index, `Enter` opens that job in follow mode, `1`–`9` opens one directly,
-  `f` follows everything. Piped, it stays a plain table.
-- **`-f` follows every log at once**, each line prefixed `[jobid]`, with a
-  **tab bar pinned under the stream** mapping keys to jobs. The focused tab is
-  highlighted; a `*` appears on any tab whose job printed output while hidden.
-  `1`–`9` solo a job (its last few unseen lines replay dimmed), `j`/`k` or
-  `n`/`p` cycle, `a` back to all, `q` quit. The bar redraws in place under the
-  scrolling log, so scrollback stays intact. `qlog -f <jobid>` streams one job
-  raw, pipeable. `qlog -f -g PATTERN` streams only matching lines.
+  index, `Enter` opens that job's page, `1`–`9` opens one directly, `f` opens
+  the "all" page. Piped, it stays a plain table.
+- **`-f` is a full-screen paged view** (alternate screen, like `less` — your
+  shell scrollback comes back untouched on quit). Every job is a page:
+  a title bar in the job's colour showing state, resource type, GPUs,
+  walltime %, points and node, the log filling the screen, and a **tab bar**
+  at the bottom mapping keys to jobs. Switching pages (`1`–`9`, `j`/`k`,
+  `a` for the all-jobs page) swaps the whole screen to that job's buffered
+  history — each page keeps the last few thousand lines. A `*` marks tabs
+  whose job printed while hidden.
+- **Scroll inside a page**: `u`/`d` half-page up/down, `g` oldest, `G` back to
+  tailing. While scrolled, the title bar counts new lines arriving below.
+- Piped, `-f` degrades to the plain `[jobid]`-prefixed stream, so
+  `qlog -f | grep loss` and `qlog -f <jobid> > out.txt` still work.
+  `qlog -f -g PATTERN` streams only matching lines in either form.
 - **`\r` progress bars are condensed**: a bar that rewrites its line without a
   newline (tqdm, Lightning) surfaces as a snapshot of its current state every
   few seconds instead of flooding or stalling the stream.
